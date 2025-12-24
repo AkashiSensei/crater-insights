@@ -20,7 +20,8 @@ crater-insights/
 │   └── lxcfs-webhook.md               # [TODO] lxcfs-webhook
 │
 ├── raids-lab/                         # 与 RAIDS Lab 实验室强耦合的内容
-│   └── ldap.md                        # [TODO] ACT LDAP 认证流程
+│   ├── authentication.md              # ACT LDAP 认证流程：三种认证方式、用户创建与状态管理、外部服务依赖关系
+│   └── go-ldap.md                     # Go LDAP 库介绍：LDAP协议基础、go-ldap/ldap和go-ldap-client库对比
 │
 ├── job-management/                    # 作业管理相关文档
 │   └── scheduling.md                  # [TODO] 不同账户下作业的排队机制和 volcano 的 queue 与调度
