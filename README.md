@@ -24,6 +24,7 @@ crater-insights/
 │   └── go-ldap.md                     # Go LDAP 库介绍：LDAP协议基础、go-ldap/ldap和go-ldap-client库对比
 │
 ├── job-management/                    # 作业管理相关文档
+│   ├── pod-configuration.md           # Pod 配置生成，包括节点亲和性等
 │   └── scheduling.md                  # [TODO] 不同账户下作业的排队机制和 volcano 的 queue 与调度
 │
 ├── resource-management/               # 资源管理相关文档
