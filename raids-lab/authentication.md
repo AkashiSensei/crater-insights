@@ -170,7 +170,7 @@ ACT-LDAP 认证直接连接 LDAP 服务器，仅进行身份验证。
 2. 后端使用 [[go-ldap#go-ldap/ldap]] 连接 LDAP 服务器（`ldap://192.168.0.10:389`），旧的 LDAP 服务器（`192.168.0.9` 因为磁盘故障而宕机）
 3. 使用管理员账号绑定（`it@lab` / `activic123`）
 4. 在搜索基准 DN 下搜索用户（使用 `sAMAccountName` 属性）
-5. 获取用户 DN 并使用用户密码进行验证
+5. 获取用户 DN 并使用用户密码进行 Bind 操作，以验证用户密码是否正确
 6. `UserAttribute` 保持为空
 7. 设置 `allowRegister = !RaidsLab.Enable`（如果启用 RaidsLab，则不允许注册）
 
@@ -196,6 +196,7 @@ Normal 认证是纯本地验证，不依赖任何外部服务。
 1. **UID/GID 分配**：
    - 如果 `RaidsLab.Enable = true`：调用 UID 服务器（`http://192.168.5.59:5000/get_user_id`）获取 UID/GID
    - 如果 `RaidsLab.Enable = false`：使用默认值 UID=1001, GID=1001
+   - 这个 UID 并没有保存在 LDAP 服务器中
 
 2. **用户状态**：所有新创建的用户都设置为 `StatusActive`（激活状态），与认证方式无关
 
