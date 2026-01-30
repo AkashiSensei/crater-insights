@@ -8,6 +8,9 @@ crater-insights/
 ├── README.md                          # 项目说明文档
 ├── prompt.md                          # 文档编写规范和提示词
 │
+├── accessibility/                     # 可访问性与用户体验相关文档
+│   └── error-return.md                # 错误信息返回与展示：前后端错误处理机制、业务错误码设计、错误消息处理流程
+│
 ├── general/                           # 通用架构与设计文档
 │   ├── backend.md                     # 后端项目结构、路由注册机制、Manager 接口设计
 │   ├── frontend.md                    # 前端项目结构、组件架构分层、路由系统、页面布局组件
