@@ -20,7 +20,8 @@ crater-insights/
 │
 ├── infrastructure/                    # 基础设施相关文档
 │   ├── ceph.md                        # [TODO] Ceph 存储系统
-│   └── lxcfs-webhook.md               # [TODO] lxcfs-webhook
+│   ├── lxcfs-webhook.md               # [TODO] lxcfs-webhook
+│   └── rdma.md                        # RDMA 在 Crater 系统中的配置与应用、软硬件需求及平台处理流程
 │
 ├── raids-lab/                         # 与 RAIDS Lab 实验室强耦合的内容
 │   ├── authentication.md              # ACT LDAP 认证流程：三种认证方式、用户创建与状态管理、外部服务依赖关系
