@@ -24,7 +24,7 @@ crater-insights/
 │   └── rdma.md                        # RDMA 在 Crater 系统中的配置与应用、软硬件需求及平台处理流程
 │
 ├── raids-lab/                         # 与 RAIDS Lab 实验室强耦合的内容
-│   ├── authentication.md              # ACT LDAP 认证流程：三种认证方式、用户创建与状态管理、外部服务依赖关系
+│   ├── authentication.md              # ACT LDAP 认证流程：两种认证方式、用户创建与状态管理、外部服务依赖关系
 │   └── go-ldap.md                     # Go LDAP 库介绍：LDAP协议基础、go-ldap/ldap和go-ldap-client库对比
 │
 ├── job-management/                    # 作业管理相关文档
