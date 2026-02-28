@@ -92,7 +92,7 @@ Crater 平台通过一套自动化的资源发现与绑定机制，将 K8s 底�
 ### 2. 管理员绑定与拓扑映射 (Administrative Binding)
 由于不同型号的 GPU（如 V100 与 A100）通常对应不同的 RDMA 网络或网卡，平台引入了“绑定”机制来描述这种拓扑对应关系：
 *   **配置方式**：管理员登录 **Crater 管理后台 (Admin Dashboard)**，在“集群管理 -> 资源管理”页面进行操作：
-    1.  **标记类型**：首先需要将同步上来的资源手动修改类型。例如，将 `nvidia.com/v100` 标记为 `gpu` 类型，将 `rdma/rdma_v100` 标记为 `rdma` 类型。
+    1.  **标记类型**：首先需要将同步上来的资源手动修改类型。例如，将 `nvidia.com/v100`标记为 `gpu` 类型，将 `rdma/rdma_v100` 标记为 `rdma` 类型。
     2.  **建立关联**：在标记为 `gpu` 的资源行中，点击“网络关联”按钮。在弹出的界面中，系统会过滤出所有 `rdma` 类型的资源，管理员选择匹配的型号点击“连接”即可。
 *   **存储形式**：绑定关系持久化存储在平台的 **关系型数据库 (Database)** 中：
     *   **关联表**：系统使用一张名为 `resource_networks` 的中间关联表（由 `ResourceNetwork` 模型定义）。
@@ -119,7 +119,7 @@ Crater 平台通过一套自动化的资源发现与绑定机制，将 K8s 底�
 在容器化环境中使用 RDMA，涉及到 Linux 内核对内存管理的深度控制。理解其机理需要从“内存固定”这一底层需求出发，逐层向上构建权限与限额的逻辑。
 
 ### 1. 根源：为什么 RDMA 需要“固定内存” (Memory Pinning)
-RDMA 的核心是让硬件（网卡 HCA）绕过 CPU 直接访问远程内存。
+RDMA 的核心是让 hardware（网卡 HCA）绕过 CPU 直接访问远程内存。
 *   **物理地址稳定性**：在普通操作中，操作系统为了优化内存，会随时进行“换页” (Paging) 或移动数据，导致虚拟地址对应的物理地址发生变化。
 *   **网卡的要求**：硬件网卡仅能识别物理地址。如果网卡正在传输数据时，内核将该页内存换出或移动，会导致传输崩溃甚至系统错误。
 *   **实现手段 (`mlock`)**：为了保证地址绝对稳定，RDMA 在传输前必须执行“内存注册” (Memory Registration, MR)。这一动作在内核层面通过 **`mlock()`** 或 **`mlockall()`** 系统调用实现，它们会将指定的虚拟内存页“锁死”在物理内存中，禁止内核对其进行移动或交换到磁盘。
@@ -157,15 +157,27 @@ RDMA 的核心是让硬件（网卡 HCA）绕过 CPU 直接访问远程内存。
 > **注意：Kubernetes 官方设计说明**
 > Kubernetes 并不直接在 Pod API (spec.containers) 中提供 `ulimit` (包括 `memlock`) 的配置项。官方认为这类系统级限制属于容器运行时（CRI）的职责范畴。因此，所有解决方案均需围绕“运行时配置”或“内核特权”展开。
 
+### 方案 A：节点运行时全局配置 (Global Modification)
+在运行 RDMA 作业的物理节点上，修改容器运行时的默认资源限制蓝图。
 
-### 方案 A：节点运行时配置（推荐，最根本）
-在运行 RDMA 作业的物理节点上，修改容器运行时的默认资源限制：
-*   **操作**：
-    *   **containerd**: 修改 `/etc/containerd/config.toml`，在 `[plugins."io.containerd.grpc.v1.cri".containerd.default_runtime.options]` 下设置 `systemd_cgroup = true` 并确保 `default_ulimits` 包含 `memlock` 为 `-1`。
-    *   **Docker**: 修改 `/etc/docker/daemon.json` 或 systemd 服务文件，添加 `"default-ulimits": {"memlock": {"Name": "memlock", "Hard": -1, "Soft": -1}}`。
-*   **风险分析**：
-    *   **资源枯竭风险**：由于该配置是全局生效的，意味着该节点上**所有**新启动的容器都将拥有无限锁页内存的权限。如果某个容器内运行了恶意程序或存在内存泄漏的 Bug 进程，它可能会锁定物理节点上几乎所有的内存，导致宿主机内核（OOM Killer）甚至无法正常工作，最终引发整个物理节点宕机。
-    *   **多租户干扰**：在多租户集群中，一个作业的异常可能会影响到同节点其他租户的任务稳定性。
+*   **操作要点**：
+    1.  **宿主机提权 (必须)**：执行 `EDITOR=vim systemctl edit containerd`，在 `[Service]` 段落添加 `LimitMEMLOCK=infinity`。这确保了父进程拥有分发额度的内核权限。
+    2.  **生成完整规范模板 (关键)**：`containerd` 不支持类似 Docker 的 `default_ulimits` 散装配置。必须先生成一个完整的 OCI 规范文件作为模板：
+        ```bash
+        ctr oci spec > /etc/containerd/cri-base.json
+        ```
+    3.  **修改模板限制**：编辑 `/etc/containerd/cri-base.json`，在 `process.rlimits` 数组中找到 `type: "RLIMIT_MEMLOCK"`，将其 `hard` 和 `soft` 修改为 `18446744073709551615` (表示无限)。
+    4.  **在配置中应用**：在 `/etc/containerd/config.toml` 的对应运行时（如 `nvidia`）下配置：
+        ```toml
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+          base_runtime_spec = "/etc/containerd/cri-base.json"
+        ```
+*   **官方支持证据**：
+    `containerd` 官方文档明确指出 `base_runtime_spec` 必须指向一个通过 `ctr oci spec` 生成的完整 JSON 文件。
+    *   **官方配置参考**：[containerd CRI Configuration - base_runtime_spec](https://github.com/containerd/containerd/blob/main/docs/cri/config.md?plain=1#L358)
+*   **常见报错排查**：
+    *   **现象**：`unable to restrict sys entries without a private MNT namespace`
+    *   **根源**：提供的 JSON 文件不完整（仅包含 `rlimits`）。`base_runtime_spec` 会**替换**而非**合并**默认配置，必须提供包含 `namespaces` 等完整定义的 JSON。
 
 ### 方案 B：增加容器特权（不推荐，安全性差）
 在 K8s Pod Spec 的 `securityContext` 中额外添加 **`CAP_SYS_RESOURCE`** 权限。
@@ -176,41 +188,39 @@ RDMA 的核心是让硬件（网卡 HCA）绕过 CPU 直接访问远程内存。
     *   **拒绝服务攻击 (DoS)**：恶意用户可以利用此权限耗尽系统的所有文件句柄或进程号，导致宿主机及节点上其他容器因无法打开新文件或创建新进程而崩溃。
     *   **破坏隔离性**：这严重违反了容器的最小权限原则，使得容器不再是一个受限的安全沙箱。
 
-### 方案 C：使用 RuntimeClass (推荐的生产级方案)
-这是目前在安全性与灵活性之间取得最佳平衡的方案。其核心思想是：**由具备特权的“管家”（运行时）提前为容器破开天花板，而不是给容器内的“住户”发钥匙。**
+### 方案 C：使用 RuntimeClass (精准修改/隔离方案)
+这是在安全性与灵活性之间取得最佳平衡的推荐方案。其核心思想是：**由具备特权的“管家”（运行时）提前为特定容器破开天花板，而保持其他容器的限制不变。**
 
-*   **实现机理**：
-    1.  **节点侧配置**：在物理节点的 `containerd` 配置文件中增加一个专门的 `rdma` handler，在该 handler 的配置中通过 `base_runtime_spec` 指向一个预定义的 OCI 规范文件。
-    2.  **集群侧定义**：在 K8s 中创建一个 `RuntimeClass` 对象（如 `name: rdma-runtime`），将其 `handler` 指向节点侧配置的名称。
-    3.  **作业侧引用**：Crater 平台在检测到作业启用 RDMA 时，自动在 Pod Spec 中注入 `runtimeClassName: rdma-runtime`。
-*   **官方支持确认**：
-    `containerd` 官方在 CRI 配置文档中明确支持了 `base_runtime_spec` 参数，该参数遵循 **OCI (Open Container Initiative) Runtime Specification** 行业标准。
-    *   **containerd 配置参考**：[containerd CRI Configuration Guide](https://github.com/containerd/containerd/blob/main/docs/cri/config.md)
-    *   **OCI Runtime Spec 标准参考**：[OCI Runtime Spec - POSIX Process Limits](https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-process-limits)
+*   **当前环境限制说明**：
+    目前许多集群的 `containerd` 配置中设置了 `default_runtime_name = "nvidia"`。这意味着所有 Pod 默认都走同一个运行时。若直接修改 `nvidia` 运行时的配置，效果将退化为方案 A（全局放开）。
+*   **精准隔离的实现机理**：
+    1.  **节点侧新增 Handler**：在 `containerd` 配置文件中保留默认的 `nvidia` 不变，新增一个专门的 `rdma` handler（或叫 `nvidia-rdma`）。
+    2.  **配置注入 (避坑指南)**：
+        *   **关键点：关于 `base_runtime_spec` 的 JSON 陷阱**。必须使用 `ctr oci spec` 生成并修改后的 **100% 完整** JSON 文件。如果 JSON 仅包含 `rlimits` 片段，`containerd` 将会用该片段**覆盖（而不是合并）**默认配置，导致容器丢失命名空间、挂载点等核心基因，引发报错：`unable to restrict sys entries without a private MNT namespace`。
+    3.  **集群侧定义资源**：在 K8s 中创建一个 `RuntimeClass` 对象（如 `name: rdma-runtime`），其 `handler` 字段指向刚才新增的名称。
+    4.  **平台精准注入**：Crater 平台仅在检测到作业明确启用了 RDMA 时，才在 Pod Spec 中注入 `runtimeClassName: rdma-runtime`。
 *   **配置示例**：
-    *   **/etc/containerd/config.toml**:
+    *   **/etc/containerd/config.toml** (新增 handler):
         ```toml
         [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.rdma]
           runtime_type = "io.containerd.runc.v2"
           base_runtime_spec = "/etc/containerd/rdma-base.json"
         ```
-    *   **/etc/containerd/rdma-base.json** (关键部分):
-        ```json
-        {
-          "process": {
-            "rlimits": [
-              {
-                "type": "RLIMIT_MEMLOCK",
-                "hard": -1,
-                "soft": -1
-              }
-            ]
-          }
-        }
-        ```
 *   **为什么更安全？**
-    *   **权限不外泄**：容器进程（PID 1）在“出生”时就已经继承了父进程（containerd handler）设定好的 unlimited 限制，因此**容器本身不需要 `CAP_SYS_RESOURCE` 特权**。
-    *   **精准隔离**：只有明确声明使用该 `RuntimeClass` 的 Pod 才会放开限制。普通 Pod 依然受到默认 handler 的 64KB 硬限制保护。
+    *   **权限不外泄**：容器进程在“出生”时即继承了 unlimited 限制，**无需 `CAP_SYS_RESOURCE` 特权**。
+    *   **严格隔离**：未声明该 `RuntimeClass` 的普通 Pod 依然受到 64KB 硬限制保护。
 *   **可行性评估**：
-    *   **结论**：**高可行性**。它是 K8s 官方推荐的用于处理特殊硬件需求或安全沙箱需求的标准方案。
-    *   **前提条件**：需要平台管理员具备对物理节点容器运行时配置的控制权（即能够执行一次性的节点初始化配置）。
+    *   **结论**：**高可行性/生产级推荐**。
+
+### 最终实现
+
+最终选用方案 A 进行实现，全局修改了节点 `dell-gpu-06` 和 `dell-gpu-32` 上的配置。
+
+同时解除了 contaienrd 自身的限制：
+
+```
+[Service]
+LimitMEMLOCK=infinity
+```
+
+但实际上没必要，通过权限检查，containerd 进程本身有突破这个限制的权限，即 `CAP_SYS_RESOURCE`。
