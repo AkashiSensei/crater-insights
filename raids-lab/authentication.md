@@ -4,6 +4,9 @@
 
 ## 更新记录
 
+> **2026-03-01** | [refactor: decoupling ACT OpenAPI (#347)](https://github.com/raids-lab/crater/commit/c1c8031f9f8b2b609133c1539586dda965657878) | `c1c8031`  
+> 补充了 ACT UID 的生成与获取逻辑，详细记录了 Winbind 的 RID 算法原理。新增了通过 LDAP `objectSid` 属性手动计算 UID 的方法，并记录了通过直接解析 SID 移除对外部 UID 查询服务（59 节点）依赖的可行性方案。
+
 > **2026-02-14** | [refactor: decoupling ACT OpenAPI (#347)](https://github.com/raids-lab/crater/commit/c1c8031f9f8b2b609133c1539586dda965657878) | `c1c8031`  
 > 更新文档以反映系统架构变化，记录解除对 ACT OpenAPI 服务依赖后的认证流程，强调 LDAP 认证现在可直接从 LDAP 服务器获取完整用户信息。
 
@@ -139,7 +142,7 @@ graph TD
 LDAP 认证直接连接 LDAP 服务器进行身份验证，并根据配置的映射同步用户信息。
 
 **流程步骤**：
-1. 前端在 LDAP 模式下，用户输入用户名和密码并点击登录。
+1. 前端在 LDAP 模式下，用户输入用户名 and 密码并点击登录。
 2. 后端使用 `github.com/go-ldap/ldap/v3` 连接 LDAP 服务器。
 3. 使用管理员账号（`bindDN` / `bindPassword`）进行初始绑定。
 4. 在搜索基准 DN（`baseDN`）下搜索用户，搜索条件基于 `attributeMapping.username`。
@@ -157,7 +160,7 @@ Normal 认证是纯本地验证，不依赖任何外部服务。
 **流程步骤**：
 1. 前端在 Normal 模式下，用户输入用户名密码。
 2. 后端从数据库查询用户。
-3. 使用 bcrypt 验证密码哈希。
+3. 使用 bcrypt 验证密码 hash。
 4. `UserAttribute` 保持为空（本地用户通常在注册或由管理员编辑时完善信息）。
 5. `allowRegister` 取决于配置项 `auth.normal.allowRegister`。
 
@@ -280,6 +283,104 @@ type UserAttribute struct {
 
 **注意**：管理员修改用户属性时，会直接覆盖整个 `UserAttribute` 对象，**没有邮箱保护机制**。
 
+## ACT UID 的生成
+
+在 Crater 系统中，当 `auth.ldap.uid.source` 配置为 `external` 时，用户的 UID/GID 分配由实验室内部的身份映射服务提供。该服务的核心是运行在 `192.168.5.59` 节点上的 **Winbind** 组件。
+
+### 核心组件定义
+
+1. **Windows Active Directory (AD)**：由微软开发的目录服务，是实验室的身份管理中心。它存储了所有用户账号、组别及权限信息。
+2. **LDAP (Lightweight Directory Access Protocol)**：一种访问目录服务的标准**应用协议**。AD 兼容 LDAP，允许第三方程序（如 Crater 后端）通过标准接口查询用户信息。
+3. **Winbind**：Samba 工具套件中的一个关键守护进程。它负责将 Windows 域环境下的 SID 身份“翻译”给 Linux，使域用户在 Linux 下表现得像本地用户。
+4. **NSS (Name Service Switch)**：Linux 系统的身份源分发器（配置文件为 `/etc/nsswitch.conf`）。它决定了系统去哪里查找用户。配置 `winbind` 关键字后，系统在 `/etc/passwd` 查不到用户时，会自动转而请求 Winbind。
+5. **域加入 (Domain Membership)**：指 59 节点在 AD 域中注册并获取“机器账号”的过程。加入域后，Linux 节点与 AD 建立了互相信任的安全通道。这种归属关系是 Winbind 能够利用 MS-RPC 协议执行特权查询（如 SID 到 UID 的翻译）的基础。
+
+### 架构协作关系
+
+在实验室当前的架构中，这三者的协作关系如下：
+
+1. **认证与属性同步**：Crater 后端通过 **LDAP 协议** 直接连接 AD (`192.168.0.10:389`)。这是为了进行用户登录验证（Bind 操作）并获取用户的详细业务属性（如邮箱、姓名等）。
+2. **UID 翻译与映射**：Crater 后端不直接向 AD 请求 UID。它转而通过接口访问 `59` 节点。该节点上的 **Winbind 服务** 通过更复杂的 **MS-RPC** 协议与 AD 建立受信任的通道，并将 Windows 专有的 SID (Security Identifier) 转换为 Linux 系统可识别的数字 UID。
+
+### 59 节点配置排查与原始输出
+
+在 `192.168.5.59` 节点上，可以通过以下命令查询身份系统的实时状态。
+
+#### 1. 查询 NSS 身份源
+**命令**：`cat /etc/nsswitch.conf | grep passwd`  
+**原始输出**：
+```text
+passwd:         files systemd winbind
+```
+**解释**：`passwd` 行包含 `winbind` 关键字，说明 NSS 已配置为在本地找不到用户时向 Winbind 发起请求。
+
+#### 2. 查询 AD 域详细信息
+**命令**：`net ads info`  
+**原始输出**：
+```text
+LDAP server: 192.168.0.10
+LDAP server name: ACT-AD-2.lab.act.buaa.edu.cn
+Realm: LAB.ACT.BUAA.EDU.CN
+Bind Path: dc=LAB,dc=ACT,dc=BUAA,dc=EDU,dc=CN
+LDAP port: 389
+KDC server: 192.168.0.10
+```
+**解释**：该命令探测的是当前机器所属的 AD 域元数据。确认了 Winbind 当前连接的目标域控制器 IP 和协议端口。
+
+#### 3. 查询 Samba 与 ID Mapping 配置
+**命令**：`cat /etc/samba/smb.conf | grep -A 10 "idmap"`  
+**原始输出**：
+```text
+idmap config * : backend        = tdb
+idmap config * : range          = 1000000-1999999
+
+idmap config LAB : backend     = rid
+idmap config LAB : range       = 10000 - 49999
+```
+**解释与算法逻辑**：
+Winbind 使用 **ID Mapping (idmap)** 机制将 Windows SID 转换为 Linux ID。根据配置，系统采用了混合映射模式：
+
+*   **LAB 域 (RID 模式)**：使用 `rid` 算法后端。
+    *   **Range (10000 - 49999)**：定义了为 `LAB` 域分配的 UID/GID 池。`10000` 是 **起始偏移量 (Low Range)**。
+    *   **UID 生成算法**：$$UID = RID + 10000$$（RID 是 Windows SID 的最后一部分标识符）。该算法**绝对持久且不可变**，只要配置不变，同一用户在任何节点上的计算结果永远相同。
+*   **默认域 (TDB 模式)**：使用 `tdb` 数据库后端。
+    *   **Range (1000000 - 1999999)**：将非域用户的 ID 隔离在百万级别，避免冲突。
+    *   **数据库位置**：记录在 `/var/lib/samba/winbindd_idmap.tdb`。UID 是按序分配的，仅在单机内保证持久。
+
+#### 4. 验证域信任关系
+**命令**：`wbinfo -t`  
+**原始输出**：
+```text
+checking the trust secret for domain LAB via RPC calls succeeded
+```
+**解释**：`succeeded` 表示 59 节点与 Windows 域控制器之间的安全通道正常，机器账号有效。
+
+### 从 LDAP 获取 SID 与 UID 计算
+
+在不依赖 Winbind 服务的情况下，可以直接从 LDAP 服务器获取用户的 SID 并计算其 UID。
+
+#### 1. 获取 objectSid 属性
+Windows SID 存储在 LDAP 用户的 **`objectSid`** 属性中。该属性以 **二进制 (Binary)** 格式存储。可以使用 `ldapsearch` 或其它 LDAP 工具进行抓取。
+
+#### 2. 解析 RID
+二进制 SID 的末尾 4 个字节代表了用户的 **RID (Relative Identifier)**。这 4 个字节构成一个 **32 位无符号整数 (uint32)**，并采用 **小端序 (Little-endian)** 存储（即低位字节在前）。
+
+#### 3. 计算 UID 算法
+得到 RID 的十进制值后，结合系统配置的起始偏移量（10000），通过以下公式计算：
+$$UID = RID + 10000$$
+
+*实测验证*：
+- 原始 objectSid (十六进制末尾): `...d16f0000`
+- 解析 RID (小端序转十进制): `0x00006FD1` -> `28625`
+- 最终 UID: $28625 + 10000 = 38625$
+
+### 外部查询接口实现
+
+为了实现服务解耦，Crater 后端并不直接操作 Winbind，而是通过一个简单的 Web 接口获取数据：
+
+- **调用链路**：`Crater Backend` -> `HTTP GET (Port 5000)` -> `Python Flask (59 节点)` -> `系统 getpwnam 调用` -> `Winbind`。
+- **服务维护**：该服务脚本为 `query_id.py`，通常通过 `nohup` 挂载在后台运行。
+
 ## 已实现的解耦
 
 Crater 平台已完成对实验室内部 ACT 特定服务的解耦：
@@ -287,7 +388,7 @@ Crater 平台已完成对实验室内部 ACT 特定服务的解耦：
 - ✅ **灵活的 UID/GID 获取**：支持从 LDAP、外部服务或默认值获取，不再硬编码。
 - ✅ **配置化映射**：通过 YAML 配置即可完成 LDAP 属性与平台字段的对接。
 
-之前的认证方式主要分为一下三种方式：
+之前的认证方式主要分为以下三种方式：
 - **Normal 认证**：本地用户名密码验证，适用于独立部署场景。
 - **ACT-LDAP 认证**：通过实验室 LDAP 服务器进行身份验证，仅进行认证不获取用户详细信息。
 - **ACT-API 认证**：通过实验室封装的 OpenAPI 服务进行 token 验证并获取完整用户信息。
