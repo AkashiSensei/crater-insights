@@ -6,6 +6,12 @@ RDMA 是 Crater 系统的扩展功能之一。
 
 ## 更新记录
 
+> **2026-03-05** | [docs: rdma pod tolerance (#358)](https://github.com/raids-lab/crater/commit/4f3167be98c8148d8dd67be4125ecc920cc7c8d7) | `4f3167b`
+> 本 RDMA 文档新增「RDMA 资源发现与上报全流程」与「故障排查」两节。「资源发现与上报全流程」给出从硬件层到平台同步层的六步流程概览，并详解三个核心组件：NVIDIA Network Operator（严格状态机、mofed.wait 锁与唯一解锁条件）、MOFED 驱动 Pod（驱动搬运与安装、持久性与 DKMS 自愈陷阱）、RDMA Shared Device Plugin Pod（Wait 机制与污点容忍），以及关键配置查询表。「故障排查」按硬件与驱动层、InfiniBand 运行状态、K8s 资源上报（Device Plugin）、驱动自愈与 K8s 状态脱节（DKMS 案例）四步提供现场排查命令与案例分析。相关现象与背景可参考 [Issue #355](https://github.com/raids-lab/crater/issues/355)。
+
+> **2026-03-01** | [docs: rdma ulimit (#353)](https://github.com/raids-lab/crater/commit/7014fc16188eb8cbbc28fcd399c0401e9126383e) | `7014fc1`
+> 重新梳理了容器内 RDMA 内存锁定的解除方案，将实践重点从高风险的容器提权转向更安全的运行时配置。文档补充了 `containerd` 的 `base_runtime_spec` 完整配置机理，详细阐述了 `CAP_IPC_LOCK`（权限准入）与 `RLIMIT_MEMLOCK`（配额限制）的分层协作原理，并提供了基于 `RuntimeClass` 实现资源限制精准隔离的生产级实践指南。
+
 > **2026-01-30** | [[feat] support rdma for custom jobs (#335)](https://github.com/raids-lab/crater/commit/6fe5499f251b030862a613d9bbbed57e9002e158) | `6fe5499`
 > 完善平台对 RDMA 的处理流程说明，明确支持包括 Jupyter 和单机作业在内的自定义作业类型。细化前端动态展示逻辑及作业创建时的双重注入机制，确保不同类型的作业均能通过绑定的 GPU 型号自动获取 RDMA 资源配置。
 
@@ -224,3 +230,123 @@ LimitMEMLOCK=infinity
 ```
 
 但实际上没必要，通过权限检查，containerd 进程本身有突破这个限制的权限，即 `CAP_SYS_RESOURCE`。
+
+## RDMA 资源发现与上报全流程
+
+Crater 平台实现从底层物理网卡到 K8s 扩展资源（如 `rdma/rdma_v100`）的自动化发现与上报，涉及硬件、驱动管理程序及多个 K8s 组件的协同工作。
+
+### 流程概览
+
+1. **硬件层**：宿主机物理安装 Mellanox 系列网卡。
+2. **编排层**：**NVIDIA Network Operator** 识别节点需求，下发管理策略。
+3. **驱动加载层**：**MOFED 驱动 Pod** 在宿主机内核中安装并加载 RDMA 相关的内核模块。
+4. **状态同步**：驱动加载成功后，Operator 自动更新节点标签，释放“等待”状态（`mofed.wait` 变为 `false`）。
+5. **资源发现层**：**RDMA Shared Device Plugin Pod** 被调度到节点，扫描物理网卡并向 Kubelet 注册扩展资源。
+6. **平台同步层**：Crater 后端通过 `SyncResource` 接口将 K8s 资源同步到数据库并完成 GPU-RDMA 的拓扑绑定。
+
+### 核心组件详解
+
+#### 1. NVIDIA Network Operator
+*   **本质定义**：它是集群中 RDMA 环境的“总管家”，是一个 Kubernetes Operator 模式的控制器。
+*   **核心功用**：负责管理所有网络相关基础设施的生命周期。它不直接传输数据，而是通过监听集群状态，自动化地在各个节点上部署驱动、插件和配置（如 `NicClusterPolicy`），确保集群的网络能力与声明的策略一致。
+*   **工作逻辑 (Strict Status Machine)**：Operator 的逻辑极其“严谨且死板”：
+    *   **状态回滚**：一旦检测到节点的内核版本（`kernel-version.full` 标签）发生变化，它会立即认为原有的驱动环境已不可信。
+    *   **逻辑锁死**：它会自动将节点标签重置为 `mofed.wait=true`，这会直接导致下游所有依赖此标签的插件（如 `rdma-shared-dp`）被停止或拒绝调度。
+    *   **唯一解锁信号**：它只信任由它**亲手调度**并成功运行的 `mofed-driver` Pod 上报的成功信号。即便宿主机通过 DKMS 等机制已经在物理层面完成了驱动自愈，只要该 Pod 没能运行（如被污点卡住），Operator 就会永远处于“逻辑锁死”状态。
+
+#### 2. MOFED 驱动 Pod (mofed-driver)
+*   **本质定义**：它是一个具有特权（Privileged）的容器，其内部打包了 Mellanox OFED 驱动的安装包和工具。
+*   **核心功用**：**它不是驱动本身，而是驱动的“搬运工”和“安装工”**。当该 Pod 在节点运行时，它会将网卡运行所需的内核模块（如 `mlx5_core`, `mlx5_ib`）编译并加载到**宿主机内核**中。
+*   **驱动持久性与自愈机制说明**：
+    *   **持久性**：驱动模块一旦加载到内核，即使 Pod 停止运行或被删除，只要宿主机不重启，驱动依然会保持工作状态。
+    *   **DKMS 自愈 (关键陷阱)**：如果宿主机安装了驱动的 DKMS (Dynamic Kernel Module Support) 版本，在内核升级后，系统会自动触发 DKMS 重新编译并加载驱动（可通过 `dkms status` 查看，如 `mlnx-ofed-kernel` 处于 `installed` 状态）。
+    *   **后果**：这会导致“物理驱动已就绪”但“K8s 编排层仍认为失效”的矛盾状态。由于 `mofed-driver` Pod 因为污点等原因没能运行，Operator 无法接收到成功信号，从而锁死后续的资源发现流程。
+*   **关键约束**：其 `nodeSelector` 必须严格匹配宿主机的内核版本。如果宿主机内核升级后没有对应版本的 Pod 运行，宿主机将丢失 RDMA 能力。
+
+#### 3. RDMA Shared Device Plugin Pod (rdma-shared-dp)
+*   **本质定义**：即 **RDMA 共享设备插件**，是 K8s 设备插件框架（Device Plugin Framework）的标准实现。
+*   **核心功用**：它负责“搭桥”。它运行在用户态，通过扫描宿主机 `/dev/infiniband/` 下的字符设备，统计可用网卡数量，并与 Kubelet 通信，将这些硬件声明为 K8s 里的虚拟资源（如 `rdma/rdma_v100`）。
+*   **关键配置**：
+    *   **Wait 机制**：它依赖 `network.nvidia.com/operator.mofed.wait: "false"` 标签。
+        *   *触发逻辑*：当 Operator 检测到节点加入、**内核升级**或驱动配置变更时，会自动将此标签设为 `true`。
+        *   *释放逻辑*：只有当 `mofed-driver` Pod 成功运行并确认驱动就绪后，Operator 才会将其改为 `false`。
+    *   **污点容忍 (Tolerations)**：在 Crater 的独占节点环境中，该 Pod 必须配置容忍 `crater.raids.io/account` 污点，否则会因无法调度而导致该节点即便硬件正常也无法上报 RDMA 资源。
+
+### 关键配置查询指南
+
+| 查询目标 | 命令 / 路径 | 关键字段 / 预期结果 |
+| :--- | :--- | :--- |
+| **Operator 状态** | `kubectl get pods -n nvidia-network-operator` | `network-operator-xxx` 处于 Running |
+| **驱动安装 Pod** | `kubectl get ds -n nvidia-network-operator \| grep mofed` | 确认对应内核版本的 DaemonSet 存在 |
+| **宿主机驱动状态** | `lsmod \| grep mlx5_ib` | 模块已成功加载到内核 |
+| **调度等待标签** | `kubectl get node <node> --show-labels` | `mofed.wait` 必须为 `false` |
+| **插件 Pod 状态** | `kubectl get pods -n nvidia-network-operator -o wide` | `rdma-shared-dp-xxx` 在目标节点正常运行 |
+| **K8s 资源可见性** | `kubectl describe node <node>` | `Allocatable` 中出现 `rdma/rdma_v100` |
+
+---
+
+## 故障排查 (Troubleshooting)
+
+当遇到 RDMA 无法正常调度或使用时，可按以下步骤进行 SSH 现场排查。
+
+### 1. 硬件与驱动层检查
+
+首先确认 Mellanox (RDMA) 驱动是否正常加载。
+
+```bash
+# 检查网卡硬件是否在 PCI 总线上（确认网卡没“掉”）
+lspci -vnn | grep -i mellanox
+
+# 检查内核模块是否已加载
+lsmod | grep mlx5_ib
+
+# 检查 dmesg 日志，看是否有驱动加载失败的报错
+# 重点关注: "failed", "error", "command failed"
+sudo dmesg | grep -E "mlx5|ib_|rdma" | tail -n 50
+```
+
+### 2. InfiniBand 运行状态检查
+
+如果驱动加载正常，接下来检查网络协议栈的状态。
+
+```bash
+# 检查 IB 设备状态
+# 预期：State 为 ACTIVE, Physical state 为 LinkUp
+ibstat
+
+# 检查用户态 Verbs 库是否能看到设备
+# 预期：显示 hca_id (如 mlx5_0) 及其端口信息
+ibv_devinfo
+
+# 检查设备文件是否存在
+# 预期：能看到 /dev/infiniband/uverbsX 等文件
+ls -l /dev/infiniband/
+```
+
+### 3. Kubernetes 资源上报检查 (Device Plugin)
+
+如果硬件和驱动都正常，但 K8s 里资源依然是 0，说明上报插件 (Device Plugin) 出了问题。
+
+```bash
+# 找到在该节点上运行的 RDMA 插件 Pod
+# 通常在 kube-system 或 nvidia-gpu-operator 命名空间
+kubectl get pods -A -o wide | grep $(hostname) | grep -E "rdma|device-plugin"
+
+# 查看插件日志 (检查是否有 "no devices found" 或 "error registering")
+kubectl logs -n <namespace> <pod_name>
+
+### 4. 驱动自愈与 K8s 状态脱节 (DKMS Case)
+
+如果 `ibstat` 正常但 K8s 资源为 0，且 `mofed.wait=true`，请检查宿主机 DKMS 状态。
+
+```bash
+# 在宿主机执行
+dkms status
+```
+
+**案例分析**：
+如果你看到类似下方的输出，说明驱动已通过系统 DKMS 自行安装，无需 `mofed-driver` Pod 介入安装：
+```text
+mlnx-ofed-kernel/25.10.OFED.25.10.1.7.1.1, 5.15.0-170-generic, x86_64: installed
+nvidia/580.126.16, 5.15.0-170-generic, x86_64: installed
+```
