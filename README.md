@@ -11,6 +11,11 @@ crater-insights/
 ├── accessibility/                     # 可访问性与用户体验相关文档
 │   └── error-return.md                # 错误信息返回与展示：前后端错误处理机制、业务错误码设计、错误消息处理流程
 │
+├── draft/                             # 初步 idea 与草案（未成文主题的可选沉淀）
+│   ├── cli-idea.md                    # crater-cli 需求与设想：命令行直连、版本兼容、CLI 与 MCP/API 的权衡
+│   ├── data-collect-idea.md           # 运行时数据收集：资源申请与实际占用、使用偏好等分析素材
+│   └── image-analysis-idea.md         # 镜像依赖与存储层分析：FROM 依赖树、层复用展示与权限可见性
+│
 ├── general/                           # 通用架构与设计文档
 │   ├── backend.md                     # 后端项目结构、路由注册机制、Manager 接口设计
 │   ├── frontend.md                    # 前端项目结构、组件架构分层、路由系统、页面布局组件
