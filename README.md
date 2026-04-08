@@ -41,5 +41,6 @@ crater-insights/
 │   └── autoscaling.md                 # [TODO] 动态扩缩容
 │
 └── resources-monitoring/              # 资源监控相关文档
+    ├── accelerator-monitoring.md       # 加速卡监控机制：体系架构、多厂商兼容现状与演进方向
     └── node-load.md                   # 节点负载功能：Pod 查询优化、API 接口分层、前端表格展示
 ```
