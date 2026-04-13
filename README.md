@@ -23,6 +23,9 @@ crater-insights/
 │   ├── architecture.md                # [TODO] 整体架构文档
 │   └── storage.md                     # [TODO] 文件系统相关文档
 │
+├── image-management/                  # 镜像管理相关文档
+│   └── capabilities.md                # 镜像能力：Crater 支持的镜像相关功能列表与技术洞察
+│
 ├── infrastructure/                    # 基础设施相关文档
 │   ├── ceph.md                        # [TODO] Ceph 存储系统
 │   ├── lxcfs-webhook.md               # [TODO] lxcfs-webhook
