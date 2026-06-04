@@ -4,6 +4,9 @@
 
 ## 更新记录
 
+> **2026-05-19** | [Merge pull request #404 from AkashiSensei/feat/cli-init](https://github.com/raids-lab/crater/commit/e131fbc219d149fd99dfb75b47875d8933f544a2) | `e131fbc`  
+> 对齐当前实现，将 ACT 环境的 UID/GID 分配机制从外部 UID 服务迁移为 `rid` 本地计算方案。重绘认证流程图，明确 UID/GID 在 `actLDAPAuth` 阶段完成；补充 `uid.source` 策略对照表、`rid` 配置项与算法说明；将 Winbind / 59 节点内容调整为存储侧背景与历史方案；更新外部服务依赖与解耦章节，反映 Crater 现仅依赖 LDAP 即可完成认证与身份映射。
+
 > **2026-03-01** | [refactor: decoupling ACT OpenAPI (#347)](https://github.com/raids-lab/crater/commit/c1c8031f9f8b2b609133c1539586dda965657878) | `c1c8031`  
 > 补充了 ACT UID 的生成与获取逻辑，详细记录了 Winbind 的 RID 算法原理。新增了通过 LDAP `objectSid` 属性手动计算 UID 的方法，并记录了通过直接解析 SID 移除对外部 UID 查询服务（59 节点）依赖的可行性方案。
 
@@ -18,9 +21,18 @@
 Crater 系统支持两种主要的用户认证方式，根据配置中的 `auth` 模块决定可用模式：
 
 - **Normal 认证**：本地用户名密码验证，适用于独立部署场景。可配置是否允许登录（`auth.normal.allowLogin`）及是否允许公开注册（`auth.normal.allowRegister`）。
-- **LDAP 认证**：通过 LDAP 服务器进行身份验证。重构后，系统能够根据配置的属性映射（`auth.ldap.attributeMapping`）直接从 LDAP 获取用户的详细信息（如姓名、邮箱、导师、过期时间等），不再依赖外部 OpenAPI 服务。
+- **LDAP 认证**：通过 LDAP 服务器进行身份验证。系统能够根据配置的属性映射（`auth.ldap.attributeMapping`）直接从 LDAP 获取用户的详细信息（如姓名、邮箱、导师、过期时间等），不再依赖外部 OpenAPI 服务。
 
-此外，系统支持多种 UID/GID 获取策略（`auth.ldap.uid.source`），包括从 LDAP 属性获取、调用外部服务或使用系统默认值。
+此外，系统支持多种 UID/GID 获取策略（`auth.ldap.uid.source`）：
+
+| `source` 值 | 行为 | 适用场景 |
+|---|---|---|
+| `default` / `none` | 使用固定默认值 UID=1001、GID=1001 | 标准 NFS 或本地存储 |
+| `ldap` | 从 LDAP 指定属性（如 `uidNumber` / `gidNumber`）读取 | 已配置 POSIX 属性的目录 |
+| `rid` | 从 LDAP 二进制 `objectSid` 和 `primaryGroupID` 本地计算 | Windows AD + Winbind 环境（**ACT 推荐**） |
+| `external` | 调用外部 HTTP 服务获取（**已弃用**） | 仅用于兼容历史部署 |
+
+Legacy token 登录（原 ACT-API 方式）已在 `Login` 入口明确拒绝，错误提示为 `Legacy token login is no longer supported`。
 
 ## LDAP 认证机制
 
@@ -64,7 +76,7 @@ graph TD
     G4 --> G5[管理员绑定 bindDN]
     G5 --> G6[搜索用户与属性抓取]
     G6 --> G7[验证用户密码]
-    G7 --> G8[填充 attributes 变量]
+    G7 --> G8[填充 attributes + 按 uid.source 计算 UID/GID]
     G8 --> G9[allowRegister = true]
     
     %% Normal 流程
@@ -85,13 +97,13 @@ graph TD
     K -->|不存在且 allowRegister=true| M[createUser 方法]
     K -->|不存在且 allowRegister=false| N[返回 ErrorMustRegister]
     
-    M --> M1{UID 获取策略?}
-    M1 -->|External| M2[调用外部 UID 服务]
-    M1 -->|LDAP| M2a[从 LDAP 属性抓取 UID/GID]
-    M1 -->|None/Default| M3[使用默认 UID=1001, GID=1001]
+    M --> M1{uid.source?}
+    M1 -->|rid / ldap| M2[使用 actLDAPAuth 已填充的 UID/GID]
+    M1 -->|external 已弃用| M2b[HTTP 调用外部 UID 服务]
+    M1 -->|default / none| M3[使用默认 UID=1001, GID=1001]
     
     M2 --> M5[创建用户到数据库]
-    M2a --> M5
+    M2b --> M5
     M3 --> M5
     
     M5 --> M6[创建默认用户队列]
@@ -107,7 +119,6 @@ graph TD
     %% 外部服务
     subgraph "外部服务依赖"
         EXT2[LDAP 服务器 - auth.ldap.server.address]
-        EXT3[UID 服务器 - auth.ldap.uid.externalService.url]
     end
     
     %% 数据库
@@ -117,7 +128,6 @@ graph TD
     
     %% 依赖关系
     G4 -.-> EXT2
-    M2 -.-> EXT3
     
     L -.->|所有方式| DB
     M5 -.->|创建用户时| DB
@@ -128,30 +138,33 @@ graph TD
     classDef database fill:#ccffcc,color:#000000
     classDef process fill:#ccccff,color:#000000
     
-    class EXT2,EXT3 external
+    class EXT2 external
     class DB database
     class G3,I3,M process
 ```
 
 ### 统一登录入口
 
-所有认证方式都通过 `backend/internal/handler/auth.go` 的 `Login` 函数统一处理，根据请求中的 `AuthMethod` 字段分发到不同的认证方法。
+所有认证方式都通过 `backend/internal/handler/auth.go` 的 `Login` 函数统一处理，根据请求中的 `AuthMethod` 字段分发到不同的认证方法。若请求携带 legacy `token` 字段，直接返回 403。
 
 ### LDAP 认证流程
 
-LDAP 认证直接连接 LDAP 服务器进行身份验证，并根据配置的映射同步用户信息。
+LDAP 认证直接连接 LDAP 服务器进行身份验证，并根据配置的映射同步用户信息。核心逻辑在 `actLDAPAuth` 中实现。
 
 **流程步骤**：
-1. 前端在 LDAP 模式下，用户输入用户名 and 密码并点击登录。
+1. 前端在 LDAP 模式下，用户输入用户名和密码并点击登录。
 2. 后端使用 `github.com/go-ldap/ldap/v3` 连接 LDAP 服务器。
 3. 使用管理员账号（`bindDN` / `bindPassword`）进行初始绑定。
-4. 在搜索基准 DN（`baseDN`）下搜索用户，搜索条件基于 `attributeMapping.username`。
+4. 在搜索基准 DN（`baseDN`）下搜索用户，搜索条件基于 `attributeMapping.username`。`prepareLDAPAttributes` 会根据 `uid.source` 追加所需属性（`rid` 模式下追加 `objectSid` 和 `primaryGroupID`）。
 5. 获取用户 DN 后，使用用户提供的密码进行 Bind 操作以验证密码。
 6. **属性同步**：根据 `attributeMapping` 配置，从 LDAP 结果中抓取 `DisplayName`、`Email`、`Teacher`、`Group`、`Phone`、`ExpiredAt` 等字段。
-7. 如果启用了 LDAP UID 来源，还会额外抓取 UID 和 GID。
+7. **UID/GID 分配**（在 `actLDAPAuth` 内完成，而非延迟到 `createUser`）：
+   - `ldap`：从 `uid.ldapAttribute.uid` / `gid` 指定的 LDAP 属性读取。
+   - `rid`：解析二进制 `objectSid` 得到用户 RID，读取 `primaryGroupID` 得到主组 RID，分别加上 `uid.rid.offset` 得到 UID 和 GID。
+   - `default` / `none` / `external`：不在此阶段填充 UID/GID（`external` 仅在 `createUser` 中通过 HTTP 获取，已弃用）。
 8. 填充 `UserAttribute` 结构体，并设置 `allowRegister = true`。
 
-**用户信息获取**：LDAP 现在是用户信息的**主要来源**。系统会根据配置的映射关系自动同步数据，不再依赖外部同步接口。
+**用户信息获取**：LDAP 是用户信息的**主要来源**。系统会根据配置的映射关系自动同步数据，不再依赖外部同步接口。
 
 ### Normal 认证流程
 
@@ -172,9 +185,9 @@ Normal 认证是纯本地验证，不依赖任何外部服务。
 
 1. **UID/GID 分配**：
    根据 `auth.ldap.uid.source` 配置决定分配策略：
-   - `external`：调用外部 UID 服务器（如 `http://192.168.5.59:5000/get_user_id`）获取。
-   - `ldap`：直接从 LDAP 服务器的指定属性（如 `uidNumber` / `gidNumber`）获取。
-   - `none` / `default`：使用系统默认值 UID=1001, GID=1001。
+   - `rid` / `ldap`：直接使用 `actLDAPAuth` 阶段已写入 `UserAttribute` 的 UID/GID，`createUser` 不再额外计算或请求。
+   - `default` / `none`：使用系统默认值 UID=1001、GID=1001。
+   - `external`（**已弃用**）：在 `createUser` 中向 `auth.ldap.uid.externalService.url` 发起 HTTP GET（query param `username`），解析返回的 JSON `{uid, gid}`。配置校验器会在启用 LDAP 且 source 为 `external` 时输出弃用警告，建议改用 `rid`。
 
 2. **用户状态**：所有新创建的用户都设置为 `StatusActive`（激活状态），与认证方式无关。
 
@@ -234,7 +247,7 @@ type UserAttribute struct {
 `updateUserIfNeeded` 函数负责更新用户属性，采用以下策略：
 
 1. **邮箱保护机制**：如果用户的邮箱已经过验证（`LastEmailVerifiedAt != nil`），则登录时不会从 LDAP 同步新邮箱。
-2. **属性合并**：同步 `Nickname`、`Teacher`、`Group`、`Phone`、`ExpiredAt` 等字段。如果配置了 LDAP 获取 UID/GID，也会一并更新。
+2. **属性合并**：同步 `Nickname`、`Teacher`、`Group`、`Phone`、`ExpiredAt` 等字段。若 LDAP 登录时带入了 UID/GID（`rid` 或 `ldap` 模式），也会一并更新。
 3. **更新条件**：只有当抓取到的属性与数据库现有数据不一致时，才会触发数据库更新。
 
 **LDAP 登录时的数据库更新**：
@@ -250,19 +263,15 @@ type UserAttribute struct {
 - **地址**：LDAP 服务器连接地址（如 `ldap://192.168.0.10:389`）
 - **管理员账号**：用于搜索用户的 `bindDN` 和 `bindPassword`
 - **搜索基准**：`baseDN`
-- **用途**：身份认证、用户信息同步
-- **返回数据**：DN 以及在 `attributeMapping` 中配置的所有属性
+- **用途**：身份认证、用户信息同步、UID/GID 计算所需的 SID 属性（`rid` 模式）
+- **返回数据**：DN 以及在 `attributeMapping` 和 `uid` 配置中声明的所有属性
 
 **重要特性**：
-- **全量同步**：LDAP 现在作为用户信息的 Single Source of Truth，支持同步多种扩展属性。
+- **全量同步**：LDAP 作为用户信息的 Single Source of Truth，支持同步多种扩展属性。
 - **属性映射**：通过 `attributeMapping` 实现灵活的字段映射，兼容不同结构的 LDAP 目录。
 - **不缓存连接**：每次认证都会重新建立 LDAP 连接，认证完成后连接关闭。
 
-### UID 服务器 (可选)
-
-- **地址**：`auth.ldap.uid.externalService.url`
-- **用途**：当 `uid.source` 设置为 `external` 时，为新用户分配 UID/GID。
-- **调用时机**：仅在创建新用户时调用。
+当前 ACT 部署下，Crater 后端**仅依赖 LDAP 服务器**即可完成认证与 UID/GID 分配，不再需要额外的 UID 查询节点。
 
 ## 管理员权限管理
 
@@ -283,40 +292,95 @@ type UserAttribute struct {
 
 **注意**：管理员修改用户属性时，会直接覆盖整个 `UserAttribute` 对象，**没有邮箱保护机制**。
 
-## ACT UID 的生成
+## ACT UID/GID 的生成
 
-在 Crater 系统中，当 `auth.ldap.uid.source` 配置为 `external` 时，用户的 UID/GID 分配由实验室内部的身份映射服务提供。该服务的核心是运行在 `192.168.5.59` 节点上的 **Winbind** 组件。
+在 ACT 环境中，存储节点通过 Winbind 的 **RID idmap** 将 AD 用户映射为 Linux UID/GID。Crater 后端通过 `auth.ldap.uid.source = "rid"` 在 LDAP 认证阶段**本地复现同一算法**，使容器内运行身份与存储侧保持一致，无需再调用外部 UID 服务。
 
-### 核心组件定义
+### 配置项
+
+配置位于 `auth.ldap.uid`，ACT 环境典型值为：
+
+```yaml
+auth:
+  ldap:
+    uid:
+      source: rid
+      rid:
+        offset: 10000                        # 与 Winbind idmap range 起始值对齐
+        sidAttribute: objectSid              # 默认 objectSid
+        pgidAttribute: primaryGroupID        # 默认 primaryGroupID
+```
+
+配置校验要求：`source` 为 `rid` 时，`auth.ldap.uid.rid.offset` 必须为正整数。
+
+### 计算时机与代码路径
+
+UID/GID 的计算发生在 `actLDAPAuth`，而非 `createUser`：
+
+1. `prepareLDAPAttributes` 在 `source = rid` 时将 `sidAttribute` 和 `pgidAttribute` 加入 LDAP 搜索属性列表。
+2. 用户 Bind 验证通过后，`populateUserAttributes` 填充业务属性。
+3. 调用 `calculateUIDFromRID` 和 `calculateGIDFromPrimaryGroup` 写入 `UserAttribute.UID` / `GID`（字符串形式的十进制数字）。
+4. `createUser` 对 `rid` / `ldap` 分支直接使用上述结果，不再发起额外请求。
+
+### 算法
+
+**UID**（`calculateUIDFromRID`）：
+
+1. 读取 LDAP 条目上 `sidAttribute`（默认 `objectSid`）的**原始二进制值**（`GetRawAttributeValue`，非字符串形式）。
+2. 调用 `parseRIDFromSID` 解析 RID：按 MS-DTYP 2.4.2.2 格式校验 SID 长度，取最后一个 4 字节 SubAuthority，按**小端序**解释为 `uint32`。
+3. 计算：`UID = RID + offset`。
+
+**GID**（`calculateGIDFromPrimaryGroup`）：
+
+1. 读取 `pgidAttribute`（默认 `primaryGroupID`）的字符串值并解析为整数（该属性本身是主组的 RID）。
+2. 计算：`GID = primaryGroupID + offset`。
+
+与 Winbind `idmap config LAB : backend = rid` 的对应关系：
+
+| 组件 | UID | GID |
+|---|---|---|
+| Winbind | `RID(objectSid) + low_range` | 主组 SID 的 RID + low_range |
+| Crater `rid` 模式 | `RID(objectSid) + offset` | `primaryGroupID + offset` |
+
+当 `offset` 与 Winbind 的 `low_range`（ACT 环境为 `10000`）一致时，Crater 分配的结果与存储节点上的 Winbind 映射一致。
+
+### 错误处理
+
+`rid` 模式下，以下情况会导致 LDAP 认证失败（返回给客户端）：
+
+- `objectSid` 属性缺失或二进制格式非法
+- `primaryGroupID` 属性缺失或无法解析为整数
+
+`external` 模式（已弃用）保留独立的错误码：`ErrorUIDServerConnect`（502）和 `ErrorUIDServerNotFound`（404）。
+
+### Winbind 背景（存储侧）
+
+实验室存储节点仍通过 Winbind 完成 AD 到 Linux 的身份映射。以下信息说明 **为何 `offset = 10000`**，以及 Crater `rid` 模式与之对齐的依据；Crater 运行时**不再调用**这些节点上的服务。
+
+#### 核心组件定义
 
 1. **Windows Active Directory (AD)**：由微软开发的目录服务，是实验室的身份管理中心。它存储了所有用户账号、组别及权限信息。
 2. **LDAP (Lightweight Directory Access Protocol)**：一种访问目录服务的标准**应用协议**。AD 兼容 LDAP，允许第三方程序（如 Crater 后端）通过标准接口查询用户信息。
-3. **Winbind**：Samba 工具套件中的一个关键守护进程。它负责将 Windows 域环境下的 SID 身份“翻译”给 Linux，使域用户在 Linux 下表现得像本地用户。
+3. **Winbind**：Samba 工具套件中的一个关键守护进程。它负责将 Windows 域环境下的 SID 身份"翻译"给 Linux，使域用户在 Linux 下表现得像本地用户。
 4. **NSS (Name Service Switch)**：Linux 系统的身份源分发器（配置文件为 `/etc/nsswitch.conf`）。它决定了系统去哪里查找用户。配置 `winbind` 关键字后，系统在 `/etc/passwd` 查不到用户时，会自动转而请求 Winbind。
-5. **域加入 (Domain Membership)**：指 59 节点在 AD 域中注册并获取“机器账号”的过程。加入域后，Linux 节点与 AD 建立了互相信任的安全通道。这种归属关系是 Winbind 能够利用 MS-RPC 协议执行特权查询（如 SID 到 UID 的翻译）的基础。
+5. **域加入 (Domain Membership)**：指存储节点在 AD 域中注册并获取"机器账号"的过程。加入域后，Linux 节点与 AD 建立了互相信任的安全通道。
 
-### 架构协作关系
-
-在实验室当前的架构中，这三者的协作关系如下：
-
-1. **认证与属性同步**：Crater 后端通过 **LDAP 协议** 直接连接 AD (`192.168.0.10:389`)。这是为了进行用户登录验证（Bind 操作）并获取用户的详细业务属性（如邮箱、姓名等）。
-2. **UID 翻译与映射**：Crater 后端不直接向 AD 请求 UID。它转而通过接口访问 `59` 节点。该节点上的 **Winbind 服务** 通过更复杂的 **MS-RPC** 协议与 AD 建立受信任的通道，并将 Windows 专有的 SID (Security Identifier) 转换为 Linux 系统可识别的数字 UID。
-
-### 59 节点配置排查与原始输出
+#### 59 节点配置排查与原始输出
 
 在 `192.168.5.59` 节点上，可以通过以下命令查询身份系统的实时状态。
 
-#### 1. 查询 NSS 身份源
-**命令**：`cat /etc/nsswitch.conf | grep passwd`  
-**原始输出**：
+**1. 查询 NSS 身份源**
+
+命令：`cat /etc/nsswitch.conf | grep passwd`
+
 ```text
 passwd:         files systemd winbind
 ```
-**解释**：`passwd` 行包含 `winbind` 关键字，说明 NSS 已配置为在本地找不到用户时向 Winbind 发起请求。
 
-#### 2. 查询 AD 域详细信息
-**命令**：`net ads info`  
-**原始输出**：
+**2. 查询 AD 域详细信息**
+
+命令：`net ads info`
+
 ```text
 LDAP server: 192.168.0.10
 LDAP server name: ACT-AD-2.lab.act.buaa.edu.cn
@@ -325,11 +389,11 @@ Bind Path: dc=LAB,dc=ACT,dc=BUAA,dc=EDU,dc=CN
 LDAP port: 389
 KDC server: 192.168.0.10
 ```
-**解释**：该命令探测的是当前机器所属的 AD 域元数据。确认了 Winbind 当前连接的目标域控制器 IP 和协议端口。
 
-#### 3. 查询 Samba 与 ID Mapping 配置
-**命令**：`cat /etc/samba/smb.conf | grep -A 10 "idmap"`  
-**原始输出**：
+**3. 查询 Samba 与 ID Mapping 配置**
+
+命令：`cat /etc/samba/smb.conf | grep -A 10 "idmap"`
+
 ```text
 idmap config * : backend        = tdb
 idmap config * : range          = 1000000-1999999
@@ -337,58 +401,35 @@ idmap config * : range          = 1000000-1999999
 idmap config LAB : backend     = rid
 idmap config LAB : range       = 10000 - 49999
 ```
-**解释与算法逻辑**：
-Winbind 使用 **ID Mapping (idmap)** 机制将 Windows SID 转换为 Linux ID。根据配置，系统采用了混合映射模式：
 
-*   **LAB 域 (RID 模式)**：使用 `rid` 算法后端。
-    *   **Range (10000 - 49999)**：定义了为 `LAB` 域分配的 UID/GID 池。`10000` 是 **起始偏移量 (Low Range)**。
-    *   **UID 生成算法**：$$UID = RID + 10000$$（RID 是 Windows SID 的最后一部分标识符）。该算法**绝对持久且不可变**，只要配置不变，同一用户在任何节点上的计算结果永远相同。
-*   **默认域 (TDB 模式)**：使用 `tdb` 数据库后端。
-    *   **Range (1000000 - 1999999)**：将非域用户的 ID 隔离在百万级别，避免冲突。
-    *   **数据库位置**：记录在 `/var/lib/samba/winbindd_idmap.tdb`。UID 是按序分配的，仅在单机内保证持久。
+Winbind 使用 **ID Mapping (idmap)** 机制将 Windows SID 转换为 Linux ID：
 
-#### 4. 验证域信任关系
-**命令**：`wbinfo -t`  
-**原始输出**：
-```text
-checking the trust secret for domain LAB via RPC calls succeeded
-```
-**解释**：`succeeded` 表示 59 节点与 Windows 域控制器之间的安全通道正常，机器账号有效。
+- **LAB 域 (RID 模式)**：`UID = RID + 10000`，其中 `10000` 是 range 起始偏移量（Low Range）。
+- **默认域 (TDB 模式)**：range `1000000-1999999`，UID 按序分配，仅在单机内保证持久。
 
-### 从 LDAP 获取 SID 与 UID 计算
+**实测验证**（手工从 LDAP objectSid 解析）：
+- 原始 objectSid 十六进制末尾：`...d16f0000`
+- 解析 RID（小端序）：`0x00006FD1` → `28625`
+- 最终 UID：`28625 + 10000 = 38625`
 
-在不依赖 Winbind 服务的情况下，可以直接从 LDAP 服务器获取用户的 SID 并计算其 UID。
+### 历史方案：外部 UID 服务（已弃用）
 
-#### 1. 获取 objectSid 属性
-Windows SID 存储在 LDAP 用户的 **`objectSid`** 属性中。该属性以 **二进制 (Binary)** 格式存储。可以使用 `ldapsearch` 或其它 LDAP 工具进行抓取。
+在引入 `rid` 模式之前，Crater 通过 `auth.ldap.uid.source = "external"` 调用实验室 59 节点上的 HTTP 服务（`query_id.py`，端口 5000）获取 UID/GID。调用链为：
 
-#### 2. 解析 RID
-二进制 SID 的末尾 4 个字节代表了用户的 **RID (Relative Identifier)**。这 4 个字节构成一个 **32 位无符号整数 (uint32)**，并采用 **小端序 (Little-endian)** 存储（即低位字节在前）。
+`Crater Backend` → `HTTP GET ?username=` → `Python Flask (59 节点)` → `getpwnam` → `Winbind`
 
-#### 3. 计算 UID 算法
-得到 RID 的十进制值后，结合系统配置的起始偏移量（10000），通过以下公式计算：
-$$UID = RID + 10000$$
-
-*实测验证*：
-- 原始 objectSid (十六进制末尾): `...d16f0000`
-- 解析 RID (小端序转十进制): `0x00006FD1` -> `28625`
-- 最终 UID: $28625 + 10000 = 38625$
-
-### 外部查询接口实现
-
-为了实现服务解耦，Crater 后端并不直接操作 Winbind，而是通过一个简单的 Web 接口获取数据：
-
-- **调用链路**：`Crater Backend` -> `HTTP GET (Port 5000)` -> `Python Flask (59 节点)` -> `系统 getpwnam 调用` -> `Winbind`。
-- **服务维护**：该服务脚本为 `query_id.py`，通常通过 `nohup` 挂载在后台运行。
+该路径已在代码中标记 `@Deprecated`，配置校验会输出警告。新部署应使用 `source: rid`，由后端直接从 LDAP 计算。
 
 ## 已实现的解耦
 
 Crater 平台已完成对实验室内部 ACT 特定服务的解耦：
+
 - ✅ **移除 OpenAPI 依赖**：直接从 LDAP 获取全量用户信息。
-- ✅ **灵活的 UID/GID 获取**：支持从 LDAP、外部服务或默认值获取，不再硬编码。
+- ✅ **移除 UID 服务器依赖**：通过 `rid` 模式在 LDAP 认证阶段本地计算 UID/GID，与 Winbind RID 算法对齐。
+- ✅ **Legacy token 登录下线**：原 ACT-API token 方式已在 `Login` 入口拒绝。
 - ✅ **配置化映射**：通过 YAML 配置即可完成 LDAP 属性与平台字段的对接。
 
-之前的认证方式主要分为以下三种方式：
-- **Normal 认证**：本地用户名密码验证，适用于独立部署场景。
-- **ACT-LDAP 认证**：通过实验室 LDAP 服务器进行身份验证，仅进行认证不获取用户详细信息。
+历史认证方式（均已不再使用）：
+
 - **ACT-API 认证**：通过实验室封装的 OpenAPI 服务进行 token 验证并获取完整用户信息。
+- **external UID 服务**：通过 59 节点 HTTP 接口间接调用 Winbind 获取 UID/GID。
